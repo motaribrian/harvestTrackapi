@@ -1,13 +1,10 @@
 package com.bwango.harvestsyncbackend.entity;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
+import jakarta.persistence.*;
 import lombok.*;
 
 @Entity
-@Table(name = "workers")
+@Table(name = "workers", indexes = {@Index(name = "idx_worker_updated_at", columnList = "updatedAt")})
 @Getter
 @Setter
 @NoArgsConstructor

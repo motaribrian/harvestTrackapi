@@ -1,6 +1,5 @@
 package com.bwango.harvestsyncbackend.service;
 
-
 import com.bwango.harvestsyncbackend.dto.SyncPayload;
 import com.bwango.harvestsyncbackend.entity.ProductivityEntryEntity;
 import com.bwango.harvestsyncbackend.entity.ShiftDayEntity;
@@ -13,8 +12,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -27,29 +26,42 @@ public class SyncService {
     @Transactional
     public SyncPayload processSync(SyncPayload clientPayload) {
         long currentServerTime = Instant.now().toEpochMilli();
-        long clientLastSync = clientPayload.getLastSyncTimestamp() != null
+        long clientLastSync = (clientPayload.getLastSyncTimestamp() != null)
                 ? clientPayload.getLastSyncTimestamp()
                 : 0L;
 
-        // 1. Ingest & Merge Workers
+        // Track incoming primary keys to prevent echo-back to the caller
+        Set<String> pushedWorkerIds = new HashSet<>();
+        Set<String> pushedShiftDayDates = new HashSet<>();
+        Set<String> pushedEntryCompositeKeys = new HashSet<>();
+
+        // ========================================================
+        // 1. PUSH PHASE: Process & Merge Client Data
+        // ========================================================
+
+        // 1.1 Merge Workers (Key: id)
         if (clientPayload.getWorkers() != null) {
             for (SyncPayload.WorkerDto dto : clientPayload.getWorkers()) {
+                if (dto.getId() == null) continue;
+                pushedWorkerIds.add(dto.getId());
+
                 Optional<WorkerEntity> existingOpt = workerRepository.findById(dto.getId());
                 if (existingOpt.isEmpty()) {
                     workerRepository.save(WorkerEntity.builder()
                             .id(dto.getId())
                             .name(dto.getName())
-                            .isActive(dto.getIsActive())
-                            .isDeleted(dto.getIsDeleted())
-                            .createdAt(dto.getCreatedAt())
+                            .isActive(Boolean.TRUE.equals(dto.getIsActive()))
+                            .isDeleted(Boolean.TRUE.equals(dto.getIsDeleted()))
+                            .createdAt(dto.getCreatedAt() != null ? dto.getCreatedAt() : currentServerTime)
                             .updatedAt(currentServerTime)
                             .build());
                 } else {
                     WorkerEntity existing = existingOpt.get();
-                    if (dto.getCreatedAt() != null && dto.getCreatedAt() >= existing.getCreatedAt()) {
+                    // Merge rule: Overwrite if client createdAt is equal or newer
+                    if (dto.getCreatedAt() == null || dto.getCreatedAt() >= existing.getCreatedAt()) {
                         existing.setName(dto.getName());
-                        existing.setIsActive(dto.getIsActive());
-                        existing.setIsDeleted(dto.getIsDeleted());
+                        existing.setIsActive(Boolean.TRUE.equals(dto.getIsActive()));
+                        existing.setIsDeleted(Boolean.TRUE.equals(dto.getIsDeleted()));
                         existing.setUpdatedAt(currentServerTime);
                         workerRepository.save(existing);
                     }
@@ -57,23 +69,26 @@ public class SyncService {
             }
         }
 
-        // 2. Ingest & Merge Shift Days
+        // 1.2 Merge Shift Days (Key: date)
         if (clientPayload.getShiftDays() != null) {
             for (SyncPayload.ShiftDayDto dto : clientPayload.getShiftDays()) {
+                if (dto.getDate() == null) continue;
+                pushedShiftDayDates.add(dto.getDate());
+
                 Optional<ShiftDayEntity> existingOpt = shiftDayRepository.findById(dto.getDate());
                 if (existingOpt.isEmpty()) {
                     shiftDayRepository.save(ShiftDayEntity.builder()
                             .date(dto.getDate())
                             .notes(dto.getNotes())
-                            .createdAt(dto.getCreatedAt())
-                            .isClosed(dto.getIsClosed())
+                            .createdAt(dto.getCreatedAt() != null ? dto.getCreatedAt() : currentServerTime)
+                            .isClosed(Boolean.TRUE.equals(dto.getIsClosed()))
                             .updatedAt(currentServerTime)
                             .build());
                 } else {
                     ShiftDayEntity existing = existingOpt.get();
-                    if (dto.getCreatedAt() != null && dto.getCreatedAt() >= existing.getCreatedAt()) {
+                    if (dto.getCreatedAt() == null || dto.getCreatedAt() >= existing.getCreatedAt()) {
                         existing.setNotes(dto.getNotes());
-                        existing.setIsClosed(dto.getIsClosed());
+                        existing.setIsClosed(Boolean.TRUE.equals(dto.getIsClosed()));
                         existing.setUpdatedAt(currentServerTime);
                         shiftDayRepository.save(existing);
                     }
@@ -81,9 +96,13 @@ public class SyncService {
             }
         }
 
-        // 3. Ingest & Merge Productivity Entries (Deduplication via workerId + timestamp)
+        // 1.3 Merge Productivity Entries (Key: workerId + timestamp to prevent ID collisions)
         if (clientPayload.getEntries() != null) {
             for (SyncPayload.ProductivityEntryDto dto : clientPayload.getEntries()) {
+                if (dto.getWorkerId() == null || dto.getTimestamp() == null) continue;
+                String compositeKey = dto.getWorkerId() + "#" + dto.getTimestamp();
+                pushedEntryCompositeKeys.add(compositeKey);
+
                 Optional<ProductivityEntryEntity> existingOpt =
                         entryRepository.findByWorkerIdAndTimestamp(dto.getWorkerId(), dto.getTimestamp());
 
@@ -108,15 +127,20 @@ public class SyncService {
             }
         }
 
-        // Flush updates before querying to ensure dirty writes are accounted for
+        // Flush dirty writes to MariaDB before running query
         workerRepository.flush();
         shiftDayRepository.flush();
         entryRepository.flush();
 
-        // 4. Query changes that occurred after client's lastSyncTimestamp
-        List<SyncPayload.WorkerDto> changedWorkers = workerRepository
+        // ========================================================
+        // 2. PULL PHASE: Query updates made after clientLastSync
+        //    (excluding entities pushed by client in this batch)
+        // ========================================================
+
+        List<SyncPayload.WorkerDto> pullWorkers = workerRepository
                 .findByUpdatedAtGreaterThan(clientLastSync)
                 .stream()
+                .filter(w -> !pushedWorkerIds.contains(w.getId()))
                 .map(w -> SyncPayload.WorkerDto.builder()
                         .id(w.getId())
                         .name(w.getName())
@@ -124,22 +148,24 @@ public class SyncService {
                         .isDeleted(w.getIsDeleted())
                         .createdAt(w.getCreatedAt())
                         .build())
-                .toList();
+                .collect(Collectors.toList());
 
-        List<SyncPayload.ShiftDayDto> changedShiftDays = shiftDayRepository
+        List<SyncPayload.ShiftDayDto> pullShiftDays = shiftDayRepository
                 .findByUpdatedAtGreaterThan(clientLastSync)
                 .stream()
+                .filter(s -> !pushedShiftDayDates.contains(s.getDate()))
                 .map(s -> SyncPayload.ShiftDayDto.builder()
                         .date(s.getDate())
                         .notes(s.getNotes())
                         .createdAt(s.getCreatedAt())
                         .isClosed(s.getIsClosed())
                         .build())
-                .toList();
+                .collect(Collectors.toList());
 
-        List<SyncPayload.ProductivityEntryDto> changedEntries = entryRepository
+        List<SyncPayload.ProductivityEntryDto> pullEntries = entryRepository
                 .findByUpdatedAtGreaterThan(clientLastSync)
                 .stream()
+                .filter(e -> !pushedEntryCompositeKeys.contains(e.getWorkerId() + "#" + e.getTimestamp()))
                 .map(e -> SyncPayload.ProductivityEntryDto.builder()
                         .id(e.getClientLocalId())
                         .date(e.getDate())
@@ -148,14 +174,16 @@ public class SyncService {
                         .hourString(e.getHourString())
                         .timestamp(e.getTimestamp())
                         .build())
-                .toList();
+                .collect(Collectors.toList());
 
-        // 5. Construct Server Payload
+        // ========================================================
+        // 3. RETURN RESPONSE
+        // ========================================================
         return SyncPayload.builder()
                 .lastSyncTimestamp(currentServerTime)
-                .workers(changedWorkers)
-                .shiftDays(changedShiftDays)
-                .entries(changedEntries)
+                .workers(pullWorkers)
+                .shiftDays(pullShiftDays)
+                .entries(pullEntries)
                 .build();
     }
 }

@@ -7,10 +7,10 @@ import lombok.*;
 @Table(
         name = "productivity_entries",
         uniqueConstraints = {
-                @UniqueConstraint(
-                        name = "uk_worker_timestamp",
-                        columnNames = {"workerId", "timestamp"}
-                )
+                @UniqueConstraint(name = "uk_worker_timestamp", columnNames = {"workerId", "timestamp"})
+        },
+        indexes = {
+                @Index(name = "idx_entry_updated_at", columnList = "updatedAt")
         }
 )
 @Getter

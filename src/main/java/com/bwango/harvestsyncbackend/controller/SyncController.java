@@ -20,7 +20,6 @@ public class SyncController {
             produces = MediaType.APPLICATION_JSON_VALUE
     )
     public ResponseEntity<SyncPayload> syncData(@RequestBody SyncPayload payload) {
-        SyncPayload response = syncService.processSync(payload);
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(syncService.processSync(payload));
     }
 }
