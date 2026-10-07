@@ -1,13 +1,14 @@
 package com.bwango.harvestsyncbackend.service;
 
 import com.bwango.harvestsyncbackend.dto.SyncPayload;
+import com.bwango.harvestsyncbackend.entity.AuditLogEntity;
 import com.bwango.harvestsyncbackend.entity.ProductivityEntryEntity;
 import com.bwango.harvestsyncbackend.entity.ShiftDayEntity;
 import com.bwango.harvestsyncbackend.entity.WorkerEntity;
+import com.bwango.harvestsyncbackend.repository.AuditLogRepository;
 import com.bwango.harvestsyncbackend.repository.ProductivityEntryRepository;
 import com.bwango.harvestsyncbackend.repository.ShiftDayRepository;
 import com.bwango.harvestsyncbackend.repository.WorkerRepository;
-import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,12 +17,19 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
-@RequiredArgsConstructor
 public class SyncService {
 
     private final WorkerRepository workerRepository;
     private final ShiftDayRepository shiftDayRepository;
     private final ProductivityEntryRepository entryRepository;
+    private final AuditLogRepository auditLogRepository;
+
+    public SyncService(WorkerRepository workerRepository, ShiftDayRepository shiftDayRepository, ProductivityEntryRepository entryRepository, AuditLogRepository auditLogRepository) {
+        this.workerRepository = workerRepository;
+        this.shiftDayRepository = shiftDayRepository;
+        this.entryRepository = entryRepository;
+        this.auditLogRepository = auditLogRepository;
+    }
 
     @Transactional
     public SyncPayload processSync(SyncPayload clientPayload) {
@@ -34,6 +42,7 @@ public class SyncService {
         Set<String> pushedWorkerIds = new HashSet<>();
         Set<String> pushedShiftDayDates = new HashSet<>();
         Set<String> pushedEntryCompositeKeys = new HashSet<>();
+        Set<String> pushedAuditLogCompositeKeys = new HashSet<>();
 
         // ========================================================
         // 1. PUSH PHASE: Process & Merge Client Data
@@ -127,10 +136,46 @@ public class SyncService {
             }
         }
 
+        // 1.4 Merge Audit Logs (Key: userId + timestamp)
+        if (clientPayload.getAuditLogs() != null) {
+            for (SyncPayload.AuditLogDto dto : clientPayload.getAuditLogs()) {
+                if (dto.getUserId() == null || dto.getTimestamp() == null) continue;
+                String compositeKey = dto.getUserId() + "#" + dto.getTimestamp();
+                pushedAuditLogCompositeKeys.add(compositeKey);
+
+                Optional<AuditLogEntity> existingOpt =
+                        auditLogRepository.findByUserIdAndTimestamp(dto.getUserId(), dto.getTimestamp());
+
+                if (existingOpt.isEmpty()) {
+                    auditLogRepository.save(AuditLogEntity.builder()
+                            .clientLocalId(dto.getId())
+                            .timestamp(dto.getTimestamp())
+                            .userId(dto.getUserId())
+                            .userName(dto.getUserName())
+                            .userRole(dto.getUserRole())
+                            .action(dto.getAction())
+                            .targetId(dto.getTargetId())
+                            .details(dto.getDetails())
+                            .updatedAt(currentServerTime)
+                            .build());
+                } else {
+                    AuditLogEntity existing = existingOpt.get();
+                    existing.setUserName(dto.getUserName());
+                    existing.setUserRole(dto.getUserRole());
+                    existing.setAction(dto.getAction());
+                    existing.setTargetId(dto.getTargetId());
+                    existing.setDetails(dto.getDetails());
+                    existing.setUpdatedAt(currentServerTime);
+                    auditLogRepository.save(existing);
+                }
+            }
+        }
+
         // Flush dirty writes to MariaDB before running query
         workerRepository.flush();
         shiftDayRepository.flush();
         entryRepository.flush();
+        auditLogRepository.flush();
 
         // ========================================================
         // 2. PULL PHASE: Query updates made after clientLastSync
@@ -176,6 +221,22 @@ public class SyncService {
                         .build())
                 .collect(Collectors.toList());
 
+        List<SyncPayload.AuditLogDto> pullAuditLogs = auditLogRepository
+                .findByUpdatedAtGreaterThan(clientLastSync)
+                .stream()
+                .filter(a -> !pushedAuditLogCompositeKeys.contains(a.getUserId() + "#" + a.getTimestamp()))
+                .map(a -> SyncPayload.AuditLogDto.builder()
+                        .id(a.getClientLocalId())
+                        .timestamp(a.getTimestamp())
+                        .userId(a.getUserId())
+                        .userName(a.getUserName())
+                        .userRole(a.getUserRole())
+                        .action(a.getAction())
+                        .targetId(a.getTargetId())
+                        .details(a.getDetails())
+                        .build())
+                .collect(Collectors.toList());
+
         // ========================================================
         // 3. RETURN RESPONSE
         // ========================================================
@@ -184,6 +245,7 @@ public class SyncService {
                 .workers(pullWorkers)
                 .shiftDays(pullShiftDays)
                 .entries(pullEntries)
+                .auditLogs(pullAuditLogs)
                 .build();
     }
 }
